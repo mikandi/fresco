@@ -18,7 +18,9 @@ import java.util.Set;
 
 import android.app.ActivityManager;
 import android.content.Context;
+import android.graphics.Bitmap;
 
+import com.facebook.cache.disk.DefaultEntryEvictionComparatorSupplier;
 import com.facebook.cache.disk.DiskCacheConfig;
 import com.facebook.common.internal.Preconditions;
 import com.facebook.common.internal.Supplier;
@@ -42,6 +44,7 @@ import com.facebook.imagepipeline.memory.PoolFactory;
 import com.facebook.imagepipeline.listener.RequestListener;
 import com.facebook.imagepipeline.producers.HttpUrlConnectionNetworkFetcher;
 import com.facebook.imagepipeline.producers.NetworkFetcher;
+import static com.facebook.common.webp.WebpSupportStatus.sWebpLibraryPresent;
 
 /**
  * Master configuration class for the image pipeline library.
@@ -65,10 +68,14 @@ public class ImagePipelineConfig {
 
   // There are a lot of parameters in this class. Please follow strict alphabetical order.
   @Nullable private final AnimatedImageFactory mAnimatedImageFactory;
+  private final Bitmap.Config mBitmapConfig;
   private final Supplier<MemoryCacheParams> mBitmapMemoryCacheParamsSupplier;
   private final CacheKeyFactory mCacheKeyFactory;
   private final Context mContext;
   private final boolean mDownsampleEnabled;
+  private final boolean mWebpSupportEnabled;
+  private final boolean mDecodeFileDescriptorEnabled;
+  private final boolean mDecodeMemoryFileEnabled;
   private final Supplier<MemoryCacheParams> mEncodedMemoryCacheParamsSupplier;
   private final ExecutorSupplier mExecutorSupplier;
   private final ImageCacheStatsTracker mImageCacheStatsTracker;
@@ -91,12 +98,20 @@ public class ImagePipelineConfig {
             new DefaultBitmapMemoryCacheParamsSupplier(
                 (ActivityManager) builder.mContext.getSystemService(Context.ACTIVITY_SERVICE)) :
             builder.mBitmapMemoryCacheParamsSupplier;
+    mBitmapConfig =
+        builder.mBitmapConfig == null ?
+            Bitmap.Config.ARGB_8888 :
+            builder.mBitmapConfig;
     mCacheKeyFactory =
         builder.mCacheKeyFactory == null ?
             DefaultCacheKeyFactory.getInstance() :
             builder.mCacheKeyFactory;
     mContext = Preconditions.checkNotNull(builder.mContext);
+    mDecodeFileDescriptorEnabled = builder.mDownsampleEnabled &&
+        builder.mDecodeFileDescriptorEnabled;
+    mDecodeMemoryFileEnabled = builder.mDecodeMemoryFileEnabled;
     mDownsampleEnabled = builder.mDownsampleEnabled;
+    mWebpSupportEnabled = builder.mWebpSupportEnabled && sWebpLibraryPresent;
     mEncodedMemoryCacheParamsSupplier =
         builder.mEncodedMemoryCacheParamsSupplier == null ?
             new DefaultEncodedMemoryCacheParamsSupplier() :
@@ -147,7 +162,6 @@ public class ImagePipelineConfig {
             builder.mSmallImageDiskCacheConfig;
 
     // Below this comment can't be built in alphabetical order, because of dependencies
-
     int numCpuBoundThreads = mPoolFactory.getFlexByteArrayPoolMaxNumThreads();
     mExecutorSupplier =
         builder.mExecutorSupplier == null ?
@@ -155,24 +169,16 @@ public class ImagePipelineConfig {
   }
 
   private static DiskCacheConfig getDefaultMainDiskCacheConfig(final Context context) {
-    return DiskCacheConfig.newBuilder()
-        .setBaseDirectoryPathSupplier(
-            new Supplier<File>() {
-              @Override
-              public File get() {
-                return context.getApplicationContext().getCacheDir();
-              }
-            })
-        .setBaseDirectoryName("image_cache")
-        .setMaxCacheSize(40 * ByteConstants.MB)
-        .setMaxCacheSizeOnLowDiskSpace(10 * ByteConstants.MB)
-        .setMaxCacheSizeOnVeryLowDiskSpace(2 * ByteConstants.MB)
-        .build();
+    return DiskCacheConfig.newBuilder(context).build();
   }
 
   @Nullable
   public AnimatedImageFactory getAnimatedImageFactory() {
     return mAnimatedImageFactory;
+  }
+
+  public Bitmap.Config getBitmapConfig() {
+    return mBitmapConfig;
   }
 
   public Supplier<MemoryCacheParams> getBitmapMemoryCacheParamsSupplier() {
@@ -185,6 +191,22 @@ public class ImagePipelineConfig {
 
   public Context getContext() {
     return mContext;
+  }
+
+  public boolean isDecodeFileDescriptorEnabled() {
+    return mDecodeFileDescriptorEnabled;
+  }
+
+  public boolean isDecodeMemoryFileEnabled() {
+    return mDecodeMemoryFileEnabled;
+  }
+
+  public boolean isDownsampleEnabled() {
+    return mDownsampleEnabled;
+  }
+
+  public boolean isWebpSupportEnabled() {
+    return mWebpSupportEnabled;
   }
 
   public Supplier<MemoryCacheParams> getEncodedMemoryCacheParamsSupplier() {
@@ -220,10 +242,6 @@ public class ImagePipelineConfig {
     return mNetworkFetcher;
   }
 
-  public boolean isDownsampleEnabled() {
-    return mDownsampleEnabled;
-  }
-
   @Nullable
   public PlatformBitmapFactory getPlatformBitmapFactory() {
     return mPlatformBitmapFactory;
@@ -256,10 +274,14 @@ public class ImagePipelineConfig {
   public static class Builder {
 
     private AnimatedImageFactory mAnimatedImageFactory;
+    private Bitmap.Config mBitmapConfig;
     private Supplier<MemoryCacheParams> mBitmapMemoryCacheParamsSupplier;
     private CacheKeyFactory mCacheKeyFactory;
     private final Context mContext;
     private boolean mDownsampleEnabled = false;
+    private boolean mWebpSupportEnabled = false;
+    private boolean mDecodeFileDescriptorEnabled = mDownsampleEnabled;
+    private boolean mDecodeMemoryFileEnabled;
     private Supplier<MemoryCacheParams> mEncodedMemoryCacheParamsSupplier;
     private ExecutorSupplier mExecutorSupplier;
     private ImageCacheStatsTracker mImageCacheStatsTracker;
@@ -285,6 +307,11 @@ public class ImagePipelineConfig {
       return this;
     }
 
+    public Builder setBitmapsConfig(Bitmap.Config config) {
+      mBitmapConfig = config;
+      return this;
+    }
+
     public Builder setBitmapMemoryCacheParamsSupplier(
         Supplier<MemoryCacheParams> bitmapMemoryCacheParamsSupplier) {
       mBitmapMemoryCacheParamsSupplier =
@@ -297,6 +324,26 @@ public class ImagePipelineConfig {
       return this;
     }
 
+    public Builder setDecodeFileDescriptorEnabled(boolean decodeFileDescriptorEnabled) {
+      mDecodeFileDescriptorEnabled = decodeFileDescriptorEnabled;
+      return this;
+    }
+
+    public Builder setDecodeMemoryFileEnabled(boolean decodeMemoryFileEnabled) {
+      mDecodeMemoryFileEnabled = decodeMemoryFileEnabled;
+      return this;
+    }
+
+    public Builder setDownsampleEnabled(boolean downsampleEnabled) {
+      mDownsampleEnabled = downsampleEnabled;
+      return this;
+    }
+
+    public Builder setWebpSupportEnabled(boolean webpSupportEnabled) {
+      mWebpSupportEnabled = webpSupportEnabled;
+      return this;
+    }
+
     public Builder setEncodedMemoryCacheParamsSupplier(
         Supplier<MemoryCacheParams> encodedMemoryCacheParamsSupplier) {
       mEncodedMemoryCacheParamsSupplier =
@@ -306,11 +353,6 @@ public class ImagePipelineConfig {
 
     public Builder setExecutorSupplier(ExecutorSupplier executorSupplier) {
       mExecutorSupplier = executorSupplier;
-      return this;
-    }
-
-    public Builder setDownsampleEnabled(boolean downsampleEnabled) {
-      this.mDownsampleEnabled = downsampleEnabled;
       return this;
     }
 

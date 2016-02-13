@@ -47,13 +47,14 @@ public class DecodeProducer implements Producer<CloseableReference<CloseableImag
   // keys for extra map
   private static final String BITMAP_SIZE_KEY = "bitmapSize";
   private static final String HAS_GOOD_QUALITY_KEY = "hasGoodQuality";
+  private static final String IMAGE_TYPE_KEY = "imageType";
   private static final String IS_FINAL_KEY = "isFinal";
 
   private final ByteArrayPool mByteArrayPool;
   private final Executor mExecutor;
   private final ImageDecoder mImageDecoder;
   private final ProgressiveJpegConfig mProgressiveJpegConfig;
-  private final Producer<EncodedImage> mNextProducer;
+  private final Producer<EncodedImage> mInputProducer;
   private final boolean mDownsampleEnabled;
   private final boolean mDownsampleEnabledForNetwork;
 
@@ -64,14 +65,14 @@ public class DecodeProducer implements Producer<CloseableReference<CloseableImag
       final ProgressiveJpegConfig progressiveJpegConfig,
       final boolean downsampleEnabled,
       final boolean downsampleEnabledForNetwork,
-      final Producer<EncodedImage> nextProducer) {
+      final Producer<EncodedImage> inputProducer) {
     mByteArrayPool = Preconditions.checkNotNull(byteArrayPool);
     mExecutor = Preconditions.checkNotNull(executor);
     mImageDecoder = Preconditions.checkNotNull(imageDecoder);
     mProgressiveJpegConfig = Preconditions.checkNotNull(progressiveJpegConfig);
     mDownsampleEnabled = downsampleEnabled;
     mDownsampleEnabledForNetwork = downsampleEnabledForNetwork;
-    mNextProducer = Preconditions.checkNotNull(nextProducer);
+    mInputProducer = Preconditions.checkNotNull(inputProducer);
   }
 
   @Override
@@ -90,7 +91,7 @@ public class DecodeProducer implements Producer<CloseableReference<CloseableImag
           jpegParser,
           mProgressiveJpegConfig);
     }
-    mNextProducer.produceResults(progressiveDecoder, producerContext);
+    mInputProducer.produceResults(progressiveDecoder, producerContext);
   }
 
   private abstract class ProgressiveDecoder extends DelegatingConsumer<
@@ -143,6 +144,10 @@ public class DecodeProducer implements Producer<CloseableReference<CloseableImag
 
     @Override
     public void onNewResultImpl(EncodedImage newResult, boolean isLast) {
+      if (isLast && !EncodedImage.isValid(newResult)) {
+        handleError(new NullPointerException("Encoded image is not valid."));
+        return;
+      }
       if (!updateDecodeJob(newResult, isLast)) {
         return;
       }
@@ -209,6 +214,7 @@ public class DecodeProducer implements Producer<CloseableReference<CloseableImag
       String queueStr = String.valueOf(queueTime);
       String qualityStr = String.valueOf(quality.isOfGoodEnoughQuality());
       String finalStr = String.valueOf(isFinal);
+      String imageTypeStr = String.valueOf(mProducerContext.getImageRequest().getImageType());
       if (image instanceof CloseableStaticBitmap) {
         Bitmap bitmap = ((CloseableStaticBitmap) image).getUnderlyingBitmap();
         String sizeStr = bitmap.getWidth() + "x" + bitmap.getHeight();
@@ -220,7 +226,9 @@ public class DecodeProducer implements Producer<CloseableReference<CloseableImag
             HAS_GOOD_QUALITY_KEY,
             qualityStr,
             IS_FINAL_KEY,
-            finalStr);
+            finalStr,
+            IMAGE_TYPE_KEY,
+            imageTypeStr);
       } else {
         return ImmutableMap.of(
             JobScheduler.QUEUE_TIME_KEY,
@@ -228,7 +236,9 @@ public class DecodeProducer implements Producer<CloseableReference<CloseableImag
             HAS_GOOD_QUALITY_KEY,
             qualityStr,
             IS_FINAL_KEY,
-            finalStr);
+            finalStr,
+            IMAGE_TYPE_KEY,
+            imageTypeStr);
       }
     }
 

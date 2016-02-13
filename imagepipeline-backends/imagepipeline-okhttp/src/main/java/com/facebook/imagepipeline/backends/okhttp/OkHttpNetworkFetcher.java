@@ -15,7 +15,6 @@ import android.os.SystemClock;
 
 import com.facebook.common.logging.FLog;
 import com.facebook.imagepipeline.image.EncodedImage;
-import com.facebook.imagepipeline.memory.PooledByteBuffer;
 import com.facebook.imagepipeline.producers.BaseNetworkFetcher;
 import com.facebook.imagepipeline.producers.BaseProducerContextCallbacks;
 import com.facebook.imagepipeline.producers.Consumer;
@@ -108,6 +107,10 @@ public class OkHttpNetworkFetcher extends
           @Override
           public void onResponse(Response response) {
             fetchState.responseTime = SystemClock.elapsedRealtime();
+            if (!response.isSuccessful()) {
+              handleException(call, new IOException("Unexpected HTTP code " + response), callback);
+              return;
+            }
             final ResponseBody body = response.body();
             try {
               long contentLength = body.contentLength();

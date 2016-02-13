@@ -11,8 +11,11 @@ package com.facebook.imagepipeline.core;
 
 import javax.annotation.concurrent.NotThreadSafe;
 
+import java.util.concurrent.ScheduledExecutorService;
+
 import android.app.ActivityManager;
 import android.content.Context;
+import android.content.res.Resources;
 import android.graphics.Rect;
 import android.os.Build;
 
@@ -37,9 +40,9 @@ import com.facebook.imagepipeline.animated.impl.AnimatedDrawableCachingBackendIm
 import com.facebook.imagepipeline.animated.impl.AnimatedDrawableCachingBackendImplProvider;
 import com.facebook.imagepipeline.animated.util.AnimatedDrawableUtil;
 import com.facebook.imagepipeline.bitmaps.ArtBitmapFactory;
-import com.facebook.imagepipeline.bitmaps.DalvikBitmapFactory;
 import com.facebook.imagepipeline.bitmaps.EmptyJpegGenerator;
 import com.facebook.imagepipeline.bitmaps.GingerbreadBitmapFactory;
+import com.facebook.imagepipeline.bitmaps.HoneycombBitmapFactory;
 import com.facebook.imagepipeline.bitmaps.PlatformBitmapFactory;
 import com.facebook.imagepipeline.cache.BitmapCountingMemoryCacheFactory;
 import com.facebook.imagepipeline.cache.BitmapMemoryCacheFactory;
@@ -52,6 +55,11 @@ import com.facebook.imagepipeline.decoder.ImageDecoder;
 import com.facebook.imagepipeline.image.CloseableImage;
 import com.facebook.imagepipeline.memory.PoolFactory;
 import com.facebook.imagepipeline.memory.PooledByteBuffer;
+import com.facebook.imagepipeline.platform.ArtDecoder;
+import com.facebook.imagepipeline.platform.GingerbreadPurgeableDecoder;
+import com.facebook.imagepipeline.platform.KitKatPurgeableDecoder;
+import com.facebook.imagepipeline.platform.PlatformDecoder;
+import com.facebook.imagepipeline.producers.ThreadHandoffProducerQueue;
 
 /**
  * Factory class for the image pipeline.
@@ -66,6 +74,7 @@ import com.facebook.imagepipeline.memory.PooledByteBuffer;
 public class ImagePipelineFactory {
 
   private static ImagePipelineFactory sInstance = null;
+  private final ThreadHandoffProducerQueue mThreadHandoffProducerQueue;
 
   /** Gets the instance of {@link ImagePipelineFactory}. */
   public static ImagePipelineFactory getInstance() {
@@ -93,6 +102,7 @@ public class ImagePipelineFactory {
 
   private final ImagePipelineConfig mConfig;
 
+  private AnimatedDrawableBackendProvider mAnimatedDrawableBackendProvider;
   private AnimatedDrawableUtil mAnimatedDrawableUtil;
   private AnimatedDrawableFactory mAnimatedDrawableFactory;
   private AnimatedImageFactory mAnimatedImageFactory;
@@ -105,14 +115,84 @@ public class ImagePipelineFactory {
   private DiskStorageCache mMainDiskStorageCache;
   private ImageDecoder mImageDecoder;
   private ImagePipeline mImagePipeline;
-  private PlatformBitmapFactory mPlatformBitmapFactory;
   private ProducerFactory mProducerFactory;
   private ProducerSequenceFactory mProducerSequenceFactory;
   private BufferedDiskCache mSmallImageBufferedDiskCache;
   private DiskStorageCache mSmallImageDiskStorageCache;
 
+  private PlatformBitmapFactory mPlatformBitmapFactory;
+  private PlatformDecoder mPlatformDecoder;
+
   public ImagePipelineFactory(ImagePipelineConfig config) {
     mConfig = Preconditions.checkNotNull(config);
+    mThreadHandoffProducerQueue = new ThreadHandoffProducerQueue(
+        config.getExecutorSupplier().forLightweightBackgroundTasks());
+  }
+
+  public static AnimatedDrawableFactory buildAnimatedDrawableFactory(
+      final SerialExecutorService serialExecutorService,
+      final ActivityManager activityManager,
+      final AnimatedDrawableUtil animatedDrawableUtil,
+      AnimatedDrawableBackendProvider animatedDrawableBackendProvider,
+      ScheduledExecutorService scheduledExecutorService,
+      final MonotonicClock monotonicClock,
+      Resources resources) {
+    AnimatedDrawableCachingBackendImplProvider animatedDrawableCachingBackendImplProvider =
+        new AnimatedDrawableCachingBackendImplProvider() {
+          @Override
+          public AnimatedDrawableCachingBackendImpl get(
+              AnimatedDrawableBackend animatedDrawableBackend,
+              AnimatedDrawableOptions options) {
+            return new AnimatedDrawableCachingBackendImpl(
+                serialExecutorService,
+                activityManager,
+                animatedDrawableUtil,
+                monotonicClock,
+                animatedDrawableBackend,
+                options);
+          }
+        };
+
+
+    return new AnimatedDrawableFactory(
+        animatedDrawableBackendProvider,
+        animatedDrawableCachingBackendImplProvider,
+        animatedDrawableUtil,
+        scheduledExecutorService,
+        resources);
+  }
+
+  public AnimatedDrawableBackendProvider getAnimatedDrawableBackendProvider() {
+    if (mAnimatedDrawableBackendProvider == null) {
+      mAnimatedDrawableBackendProvider = new AnimatedDrawableBackendProvider() {
+        @Override
+        public AnimatedDrawableBackend get(AnimatedImageResult animatedImageResult, Rect bounds) {
+          return new AnimatedDrawableBackendImpl(
+              getAnimatedDrawableUtil(),
+              animatedImageResult,
+              bounds);
+        }
+      };
+    }
+    return mAnimatedDrawableBackendProvider;
+  }
+
+  public AnimatedDrawableFactory getAnimatedDrawableFactory() {
+    if (mAnimatedDrawableFactory == null) {
+      SerialExecutorService serialExecutorService =
+          new DefaultSerialExecutorService(mConfig.getExecutorSupplier().forDecode());
+      ActivityManager activityManager =
+          (ActivityManager) mConfig.getContext().getSystemService(Context.ACTIVITY_SERVICE);
+      mAnimatedDrawableFactory = buildAnimatedDrawableFactory(
+          serialExecutorService,
+          activityManager,
+          getAnimatedDrawableUtil(),
+          getAnimatedDrawableBackendProvider(),
+          UiThreadImmediateExecutorService.getInstance(),
+          RealtimeSinceBootClock.get(),
+          mConfig.getContext().getResources());
+    }
+    return mAnimatedDrawableFactory;
   }
 
   // We need some of these methods public for now so internal code can use them.
@@ -196,7 +276,10 @@ public class ImagePipelineFactory {
       if (mConfig.getImageDecoder() != null) {
         mImageDecoder = mConfig.getImageDecoder();
       } else {
-        mImageDecoder = new ImageDecoder(getAnimatedImageFactory(), getPlatformBitmapFactory());
+        mImageDecoder = new ImageDecoder(
+            getAnimatedImageFactory(),
+            getPlatformDecoder(),
+            mConfig.getBitmapConfig());
       }
     }
     return mImageDecoder;
@@ -233,35 +316,77 @@ public class ImagePipelineFactory {
               mConfig.getIsPrefetchEnabledSupplier(),
               getBitmapMemoryCache(),
               getEncodedMemoryCache(),
-              getMainDiskStorageCache(),
-              getSmallImageDiskStorageCache(),
-              mConfig.getCacheKeyFactory());
+              getMainBufferedDiskCache(),
+              getSmallImageBufferedDiskCache(),
+              mConfig.getCacheKeyFactory(),
+              mThreadHandoffProducerQueue);
     }
     return mImagePipeline;
   }
 
+  /**
+   * Provide the implementation of the PlatformBitmapFactory for the current platform
+   * using the provided PoolFactory
+   *
+   * @param poolFactory The PoolFactory
+   * @param platformDecoder The PlatformDecoder
+   * @return The PlatformBitmapFactory implementation
+   */
   public static PlatformBitmapFactory buildPlatformBitmapFactory(
-      PoolFactory poolFactory) {
-    GingerbreadBitmapFactory factoryGingerbread =
-        Build.VERSION.SDK_INT < Build.VERSION_CODES.HONEYCOMB ?
-            new GingerbreadBitmapFactory() : null;
-    DalvikBitmapFactory factoryICS = new DalvikBitmapFactory(
-        new EmptyJpegGenerator(poolFactory.getPooledByteBufferFactory()),
-        poolFactory.getFlexByteArrayPool());
-    ArtBitmapFactory factoryLollipop = Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP ?
-        new ArtBitmapFactory(
-            poolFactory.getBitmapPool(),
-            poolFactory.getFlexByteArrayPoolMaxNumThreads()) :
-        null;
-    return new PlatformBitmapFactory(factoryGingerbread, factoryICS, factoryLollipop);
+      PoolFactory poolFactory,
+      PlatformDecoder platformDecoder) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+      return new ArtBitmapFactory(poolFactory.getBitmapPool());
+    } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.HONEYCOMB) {
+      return new HoneycombBitmapFactory(
+          new EmptyJpegGenerator(poolFactory.getPooledByteBufferFactory()),
+          platformDecoder);
+    } else {
+      return new GingerbreadBitmapFactory();
+    }
   }
 
-  private PlatformBitmapFactory getPlatformBitmapFactory() {
+  public PlatformBitmapFactory getPlatformBitmapFactory() {
     if (mPlatformBitmapFactory == null) {
       mPlatformBitmapFactory = buildPlatformBitmapFactory(
-          mConfig.getPoolFactory());
+          mConfig.getPoolFactory(),
+          getPlatformDecoder());
     }
     return mPlatformBitmapFactory;
+  }
+
+  /**
+   * Provide the implementation of the PlatformDecoder for the current platform using the
+   * provided PoolFactory
+   *
+   * @param poolFactory The PoolFactory
+   * @return The PlatformDecoder implementation
+   */
+  public static PlatformDecoder buildPlatformDecoder(
+      PoolFactory poolFactory,
+      boolean decodeMemoryFileEnabled,
+      boolean webpSupportEnabled) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+      return new ArtDecoder(
+          poolFactory.getBitmapPool(),
+          poolFactory.getFlexByteArrayPoolMaxNumThreads());
+    } else {
+      if (decodeMemoryFileEnabled && Build.VERSION.SDK_INT < Build.VERSION_CODES.KITKAT) {
+        return new GingerbreadPurgeableDecoder(webpSupportEnabled);
+      } else {
+        return new KitKatPurgeableDecoder(poolFactory.getFlexByteArrayPool());
+      }
+    }
+  }
+
+  public PlatformDecoder getPlatformDecoder() {
+    if (mPlatformDecoder == null) {
+      mPlatformDecoder = buildPlatformDecoder(
+          mConfig.getPoolFactory(),
+          mConfig.isDecodeMemoryFileEnabled(),
+          mConfig.isWebpSupportEnabled());
+    }
+    return mPlatformDecoder;
   }
 
   private ProducerFactory getProducerFactory() {
@@ -281,7 +406,8 @@ public class ImagePipelineFactory {
               getMainBufferedDiskCache(),
               getSmallImageBufferedDiskCache(),
               mConfig.getCacheKeyFactory(),
-              getPlatformBitmapFactory());
+              getPlatformBitmapFactory(),
+              mConfig.isDecodeFileDescriptorEnabled());
     }
     return mProducerFactory;
   }
@@ -293,7 +419,9 @@ public class ImagePipelineFactory {
               getProducerFactory(),
               mConfig.getNetworkFetcher(),
               mConfig.isResizeAndRotateEnabledForNetwork(),
-              mConfig.isDownsampleEnabled());
+              mConfig.isDownsampleEnabled(),
+              mConfig.isWebpSupportEnabled(),
+              mThreadHandoffProducerQueue);
     }
     return mProducerSequenceFactory;
   }
@@ -318,47 +446,5 @@ public class ImagePipelineFactory {
               mConfig.getImageCacheStatsTracker());
     }
     return mSmallImageBufferedDiskCache;
-  }
-
-  public AnimatedDrawableFactory getAnimatedDrawableFactory() {
-    if (mAnimatedDrawableFactory == null) {
-      final AnimatedDrawableUtil animatedDrawableUtil = getAnimatedDrawableUtil();
-      final MonotonicClock monotonicClock = RealtimeSinceBootClock.get();
-      final SerialExecutorService serialExecutorService =
-          new DefaultSerialExecutorService(mConfig.getExecutorSupplier().forDecode());
-      final ActivityManager activityManager =
-          (ActivityManager) mConfig.getContext().getSystemService(Context.ACTIVITY_SERVICE);
-
-      AnimatedDrawableCachingBackendImplProvider animatedDrawableCachingBackendImplProvider =
-          new AnimatedDrawableCachingBackendImplProvider() {
-            @Override
-            public AnimatedDrawableCachingBackendImpl get(
-                AnimatedDrawableBackend animatedDrawableBackend,
-                AnimatedDrawableOptions options) {
-              return new AnimatedDrawableCachingBackendImpl(
-                  serialExecutorService,
-                  activityManager,
-                  animatedDrawableUtil,
-                  monotonicClock,
-                  animatedDrawableBackend,
-                  options);
-            }
-          };
-
-      AnimatedDrawableBackendProvider backendProvider = new AnimatedDrawableBackendProvider() {
-        @Override
-        public AnimatedDrawableBackend get(AnimatedImageResult animatedImageResult, Rect bounds) {
-          return new AnimatedDrawableBackendImpl(animatedDrawableUtil, animatedImageResult, bounds);
-        }
-      };
-
-      mAnimatedDrawableFactory = new AnimatedDrawableFactory(
-          backendProvider,
-          animatedDrawableCachingBackendImplProvider,
-          animatedDrawableUtil,
-          UiThreadImmediateExecutorService.getInstance(),
-          mConfig.getContext().getResources());
-    }
-    return mAnimatedDrawableFactory;
   }
 }

@@ -19,7 +19,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import android.net.Uri;
 
 import com.facebook.cache.common.CacheKey;
-import com.facebook.cache.disk.DiskStorageCache;
 import com.facebook.common.internal.Objects;
 import com.facebook.common.internal.Preconditions;
 import com.facebook.common.internal.Supplier;
@@ -27,7 +26,9 @@ import com.facebook.common.references.CloseableReference;
 import com.facebook.common.util.UriUtil;
 import com.facebook.datasource.DataSource;
 import com.facebook.datasource.DataSources;
+import com.facebook.datasource.SimpleDataSource;
 import com.facebook.imagepipeline.cache.BitmapMemoryCacheKey;
+import com.facebook.imagepipeline.cache.BufferedDiskCache;
 import com.facebook.imagepipeline.cache.MemoryCache;
 import com.facebook.imagepipeline.cache.CacheKeyFactory;
 import com.facebook.imagepipeline.common.Priority;
@@ -41,16 +42,19 @@ import com.facebook.imagepipeline.listener.ForwardingRequestListener;
 import com.facebook.imagepipeline.request.ImageRequest;
 import com.facebook.imagepipeline.listener.RequestListener;
 
+import bolts.Continuation;
 import com.android.internal.util.Predicate;
 
 import com.facebook.imagepipeline.request.ImageRequestBuilder;
+
+import bolts.Task;
+import com.facebook.imagepipeline.producers.ThreadHandoffProducerQueue;
 
 /**
  * The entry point for the image pipeline.
  */
 @ThreadSafe
 public class ImagePipeline {
-
   private static final CancellationException PREFETCH_EXCEPTION =
       new CancellationException("Prefetching is not enabled");
 
@@ -59,10 +63,10 @@ public class ImagePipeline {
   private final Supplier<Boolean> mIsPrefetchEnabledSupplier;
   private final MemoryCache<CacheKey, CloseableImage> mBitmapMemoryCache;
   private final MemoryCache<CacheKey, PooledByteBuffer> mEncodedMemoryCache;
-  private final DiskStorageCache mMainDiskStorageCache;
-  private final DiskStorageCache mSmallImageDiskStorageCache;
+  private final BufferedDiskCache mMainBufferedDiskCache;
+  private final BufferedDiskCache mSmallImageBufferedDiskCache;
   private final CacheKeyFactory mCacheKeyFactory;
-
+  private final ThreadHandoffProducerQueue mThreadHandoffProducerQueue;
   private AtomicLong mIdCounter;
 
   public ImagePipeline(
@@ -71,18 +75,20 @@ public class ImagePipeline {
       Supplier<Boolean> isPrefetchEnabledSupplier,
       MemoryCache<CacheKey, CloseableImage> bitmapMemoryCache,
       MemoryCache<CacheKey, PooledByteBuffer> encodedMemoryCache,
-      DiskStorageCache mainDiskStorageCache,
-      DiskStorageCache smallImageDiskStorageCache,
-      CacheKeyFactory cacheKeyFactory) {
+      BufferedDiskCache mainBufferedDiskCache,
+      BufferedDiskCache smallImageBufferedDiskCache,
+      CacheKeyFactory cacheKeyFactory,
+      ThreadHandoffProducerQueue threadHandoffProducerQueue) {
     mIdCounter = new AtomicLong();
     mProducerSequenceFactory = producerSequenceFactory;
     mRequestListener = new ForwardingRequestListener(requestListeners);
     mIsPrefetchEnabledSupplier = isPrefetchEnabledSupplier;
     mBitmapMemoryCache = bitmapMemoryCache;
     mEncodedMemoryCache = encodedMemoryCache;
-    mMainDiskStorageCache = mainDiskStorageCache;
-    mSmallImageDiskStorageCache = smallImageDiskStorageCache;
+    mMainBufferedDiskCache = mainBufferedDiskCache;
+    mSmallImageBufferedDiskCache = smallImageBufferedDiskCache;
     mCacheKeyFactory = cacheKeyFactory;
+    mThreadHandoffProducerQueue = threadHandoffProducerQueue;
   }
 
   /**
@@ -114,6 +120,32 @@ public class ImagePipeline {
         } else {
           return fetchDecodedImage(imageRequest, callerContext);
         }
+      }
+
+      @Override
+      public String toString() {
+        return Objects.toStringHelper(this)
+            .add("uri", imageRequest.getSourceUri())
+            .toString();
+      }
+    };
+  }
+
+  /**
+   * Returns a DataSource supplier that will on get submit the request for execution and return a
+   * DataSource representing the pending results of the task.
+   *
+   * @param imageRequest the request to submit (what to execute).
+   * @return a DataSource representing pending results and completion of the request
+   */
+  public Supplier<DataSource<CloseableReference<PooledByteBuffer>>>
+      getEncodedImageDataSourceSupplier(
+          final ImageRequest imageRequest,
+          final Object callerContext) {
+    return new Supplier<DataSource<CloseableReference<PooledByteBuffer>>>() {
+      @Override
+      public DataSource<CloseableReference<PooledByteBuffer>> get() {
+        return fetchEncodedImage(imageRequest, callerContext);
       }
 
       @Override
@@ -262,19 +294,10 @@ public class ImagePipeline {
    * @param uri The uri of the image to evict
    */
   public void evictFromMemoryCache(final Uri uri) {
-    final String cacheKeySourceString = mCacheKeyFactory.getCacheKeySourceUri(uri).toString();
-    Predicate<CacheKey> bitmapCachePredicate =
-        new Predicate<CacheKey>() {
-          @Override
-          public boolean apply(CacheKey key) {
-            if (key instanceof BitmapMemoryCacheKey) {
-              return ((BitmapMemoryCacheKey) key).getSourceUriString().equals(cacheKeySourceString);
-            }
-            return false;
-          }
-        };
+    Predicate<CacheKey> bitmapCachePredicate = predicateForUri(uri);
     mBitmapMemoryCache.removeAll(bitmapCachePredicate);
 
+    final String cacheKeySourceString = mCacheKeyFactory.getCacheKeySourceUri(uri).toString();
     Predicate<CacheKey> encodedCachePredicate =
         new Predicate<CacheKey>() {
           @Override
@@ -292,9 +315,7 @@ public class ImagePipeline {
    * @param uri The uri of the image to evict
    */
   public void evictFromDiskCache(final Uri uri) {
-    final CacheKey cacheKey = mCacheKeyFactory.getEncodedCacheKey(ImageRequest.fromUri(uri));
-    mMainDiskStorageCache.remove(cacheKey);
-    mSmallImageDiskStorageCache.remove(cacheKey);
+    evictFromDiskCache(ImageRequest.fromUri(uri));
   }
 
   /**
@@ -304,8 +325,8 @@ public class ImagePipeline {
    */
   public void evictFromDiskCache(final ImageRequest imageRequest) {
     final CacheKey cacheKey = mCacheKeyFactory.getEncodedCacheKey(imageRequest);
-    mMainDiskStorageCache.remove(cacheKey);
-    mSmallImageDiskStorageCache.remove(cacheKey);
+    mMainBufferedDiskCache.remove(cacheKey);
+    mSmallImageBufferedDiskCache.remove(cacheKey);
   }
 
   /**
@@ -339,8 +360,8 @@ public class ImagePipeline {
    * Clear disk caches
    */
   public void clearDiskCaches() {
-    mMainDiskStorageCache.clearAll();
-    mSmallImageDiskStorageCache.clearAll();
+    mMainBufferedDiskCache.clearAll();
+    mSmallImageBufferedDiskCache.clearAll();
   }
 
   /**
@@ -349,6 +370,78 @@ public class ImagePipeline {
   public void clearCaches() {
     clearMemoryCaches();
     clearDiskCaches();
+  }
+
+  /**
+   * Returns whether the image is stored in the bitmap memory cache.
+   *
+   * @param uri the uri for the image to be looked up.
+   * @return true if the image was found in the bitmap memory cache, false otherwise
+   */
+  public boolean isInBitmapMemoryCache(final Uri uri) {
+    Predicate<CacheKey> bitmapCachePredicate = predicateForUri(uri);
+    return mBitmapMemoryCache.contains(bitmapCachePredicate);
+ }
+
+  /**
+   * Returns whether the image is stored in the bitmap memory cache.
+   *
+   * @param imageRequest the imageRequest for the image to be looked up.
+   * @return true if the image was found in the bitmap memory cache, false otherwise.
+   */
+  public boolean isInBitmapMemoryCache(final ImageRequest imageRequest) {
+    final CacheKey cacheKey = mCacheKeyFactory.getBitmapCacheKey(imageRequest);
+    CloseableReference<CloseableImage> ref = mBitmapMemoryCache.get(cacheKey);
+    try {
+      return CloseableReference.isValid(ref);
+    } finally {
+      CloseableReference.closeSafely(ref);
+    }
+  }
+
+  /**
+   * Returns whether the image is stored in the disk cache.
+   *
+   * <p>If you have supplied your own cache key factory when configuring the pipeline, this method
+   * may not work correctly. It will only work if the custom factory builds the cache key entirely
+   * from the URI. If that is not the case, use {@link #isInDiskCache(ImageRequest)}.
+   *
+   * @param uri the uri for the image to be looked up.
+   * @return true if the image was found in the disk cache, false otherwise.
+   */
+  public DataSource<Boolean> isInDiskCache(final Uri uri) {
+    return isInDiskCache(ImageRequest.fromUri(uri));
+  }
+
+  /**
+   * Returns whether the image is stored in the disk cache.
+   *
+   * @param imageRequest the imageRequest for the image to be looked up.
+   * @return true if the image was found in the disk cache, false otherwise.
+   */
+  public DataSource<Boolean> isInDiskCache(final ImageRequest imageRequest) {
+    final CacheKey cacheKey = mCacheKeyFactory.getEncodedCacheKey(imageRequest);
+    final SimpleDataSource<Boolean> dataSource = SimpleDataSource.create();
+    mMainBufferedDiskCache.contains(cacheKey)
+        .continueWithTask(
+            new Continuation<Boolean, Task<Boolean>>() {
+              @Override
+              public Task<Boolean> then(Task<Boolean> task) throws Exception {
+                if (!task.isCancelled() && !task.isFaulted() && task.getResult()) {
+                  return Task.forResult(true);
+                }
+                return mSmallImageBufferedDiskCache.contains(cacheKey);
+              }
+            })
+        .continueWith(
+            new Continuation<Boolean, Void>() {
+              @Override
+              public Void then(Task<Boolean> task) throws Exception {
+                dataSource.setResult(!task.isCancelled() && !task.isFaulted() && task.getResult());
+                return null;
+              }
+            });
+    return dataSource;
   }
 
   private <T> DataSource<CloseableReference<T>> submitFetchRequest(
@@ -406,5 +499,30 @@ public class ImagePipeline {
     } catch (Exception exception) {
       return DataSources.immediateFailedDataSource(exception);
     }
+  }
+
+  private Predicate<CacheKey> predicateForUri(Uri uri) {
+    final String cacheKeySourceString = mCacheKeyFactory.getCacheKeySourceUri(uri).toString();
+    return new Predicate<CacheKey>() {
+          @Override
+          public boolean apply(CacheKey key) {
+            if (key instanceof BitmapMemoryCacheKey) {
+              return ((BitmapMemoryCacheKey) key).getSourceUriString().equals(cacheKeySourceString);
+            }
+            return false;
+          }
+        };
+  }
+
+  public void pause() {
+    mThreadHandoffProducerQueue.startQueueing();
+  }
+
+  public void resume() {
+    mThreadHandoffProducerQueue.stopQueuing();
+  }
+
+  public boolean isPaused() {
+    return mThreadHandoffProducerQueue.isQueueing();
   }
 }
