@@ -9,9 +9,13 @@
 
 package com.facebook.imagepipeline.core;
 
+import java.util.ArrayList;
+import java.util.List;
+
 import android.net.Uri;
 
 import com.facebook.cache.common.CacheKey;
+import com.facebook.cache.common.MultiCacheKey;
 import com.facebook.cache.common.SimpleCacheKey;
 import com.facebook.common.internal.Sets;
 import com.facebook.common.internal.Supplier;
@@ -284,7 +288,6 @@ public class ImagePipelineTest {
   public void testEvictFromMemoryCache() {
     String uriString = "http://dummy/string";
     Uri uri = Uri.parse(uriString);
-    when(mCacheKeyFactory.getCacheKeySourceUri(uri)).thenReturn(uri);
     mImagePipeline.evictFromMemoryCache(uri);
 
     CacheKey dummyCacheKey = mock(CacheKey.class);
@@ -296,8 +299,8 @@ public class ImagePipelineTest {
         bitmapCachePredicateCaptor.getValue();
     BitmapMemoryCacheKey bitmapMemoryCacheKey1 = mock(BitmapMemoryCacheKey.class);
     BitmapMemoryCacheKey bitmapMemoryCacheKey2 = mock(BitmapMemoryCacheKey.class);
-    when(bitmapMemoryCacheKey1.getSourceUriString()).thenReturn(uriString);
-    when(bitmapMemoryCacheKey2.getSourceUriString()).thenReturn("rubbish");
+    when(bitmapMemoryCacheKey1.containsUri(uri)).thenReturn(true);
+    when(bitmapMemoryCacheKey2.containsUri(uri)).thenReturn(false);
     assertTrue(bitmapMemoryCacheKeyPredicate.apply(bitmapMemoryCacheKey1));
     assertFalse(bitmapMemoryCacheKeyPredicate.apply(bitmapMemoryCacheKey2));
     assertFalse(bitmapMemoryCacheKeyPredicate.apply(dummyCacheKey));
@@ -319,15 +322,19 @@ public class ImagePipelineTest {
     String uriString = "http://dummy/string";
     Uri uri = Uri.parse(uriString);
     CacheKey dummyCacheKey = mock(CacheKey.class);
-    when(mCacheKeyFactory.getEncodedCacheKey(any(ImageRequest.class))).thenReturn(dummyCacheKey);
+    List<CacheKey> list = new ArrayList<>();
+    list.add(dummyCacheKey);
+    MultiCacheKey multiKey = new MultiCacheKey(list);
+    when(mCacheKeyFactory.getEncodedCacheKey(any(ImageRequest.class))).thenReturn(multiKey);
     mImagePipeline.evictFromDiskCache(uri);
-    verify(mMainDiskStorageCache).remove(dummyCacheKey);
-    verify(mSmallImageDiskStorageCache).remove(dummyCacheKey);
+    verify(mMainDiskStorageCache).remove(multiKey);
+    verify(mSmallImageDiskStorageCache).remove(multiKey);
   }
 
   @Test
   public void testClearMemoryCaches() {
     String uriString = "http://dummy/string";
+    Uri uri = Uri.parse(uriString);
     CacheKey dummyCacheKey = mock(CacheKey.class);
 
     mImagePipeline.clearMemoryCaches();
@@ -339,8 +346,8 @@ public class ImagePipelineTest {
         bitmapCachePredicateCaptor.getValue();
     BitmapMemoryCacheKey bitmapMemoryCacheKey1 = mock(BitmapMemoryCacheKey.class);
     BitmapMemoryCacheKey bitmapMemoryCacheKey2 = mock(BitmapMemoryCacheKey.class);
-    when(bitmapMemoryCacheKey1.getSourceUriString()).thenReturn(uriString);
-    when(bitmapMemoryCacheKey2.getSourceUriString()).thenReturn("rubbish");
+    when(bitmapMemoryCacheKey1.containsUri(uri)).thenReturn(true);
+    when(bitmapMemoryCacheKey2.containsUri(uri)).thenReturn(false);
     assertTrue(bitmapMemoryCacheKeyPredicate.apply(bitmapMemoryCacheKey1));
     assertTrue(bitmapMemoryCacheKeyPredicate.apply(bitmapMemoryCacheKey2));
     assertTrue(bitmapMemoryCacheKeyPredicate.apply(dummyCacheKey));

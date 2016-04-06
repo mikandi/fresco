@@ -27,7 +27,6 @@ import com.facebook.common.util.UriUtil;
 import com.facebook.datasource.DataSource;
 import com.facebook.datasource.DataSources;
 import com.facebook.datasource.SimpleDataSource;
-import com.facebook.imagepipeline.cache.BitmapMemoryCacheKey;
 import com.facebook.imagepipeline.cache.BufferedDiskCache;
 import com.facebook.imagepipeline.cache.MemoryCache;
 import com.facebook.imagepipeline.cache.CacheKeyFactory;
@@ -294,18 +293,9 @@ public class ImagePipeline {
    * @param uri The uri of the image to evict
    */
   public void evictFromMemoryCache(final Uri uri) {
-    Predicate<CacheKey> bitmapCachePredicate = predicateForUri(uri);
-    mBitmapMemoryCache.removeAll(bitmapCachePredicate);
-
-    final String cacheKeySourceString = mCacheKeyFactory.getCacheKeySourceUri(uri).toString();
-    Predicate<CacheKey> encodedCachePredicate =
-        new Predicate<CacheKey>() {
-          @Override
-          public boolean apply(CacheKey key) {
-            return key.toString().equals(cacheKeySourceString);
-          }
-        };
-    mEncodedMemoryCache.removeAll(encodedCachePredicate);
+    Predicate<CacheKey> predicate = predicateForUri(uri);
+    mBitmapMemoryCache.removeAll(predicate);
+    mEncodedMemoryCache.removeAll(predicate);
   }
 
   /**
@@ -324,7 +314,7 @@ public class ImagePipeline {
    * @param imageRequest The imageRequest for the image to evict from disk cache
    */
   public void evictFromDiskCache(final ImageRequest imageRequest) {
-    final CacheKey cacheKey = mCacheKeyFactory.getEncodedCacheKey(imageRequest);
+    CacheKey cacheKey = mCacheKeyFactory.getEncodedCacheKey(imageRequest);
     mMainBufferedDiskCache.remove(cacheKey);
     mSmallImageBufferedDiskCache.remove(cacheKey);
   }
@@ -501,15 +491,11 @@ public class ImagePipeline {
     }
   }
 
-  private Predicate<CacheKey> predicateForUri(Uri uri) {
-    final String cacheKeySourceString = mCacheKeyFactory.getCacheKeySourceUri(uri).toString();
+  private Predicate<CacheKey> predicateForUri(final Uri uri) {
     return new Predicate<CacheKey>() {
           @Override
           public boolean apply(CacheKey key) {
-            if (key instanceof BitmapMemoryCacheKey) {
-              return ((BitmapMemoryCacheKey) key).getSourceUriString().equals(cacheKeySourceString);
-            }
-            return false;
+            return key.containsUri(uri);
           }
         };
   }
